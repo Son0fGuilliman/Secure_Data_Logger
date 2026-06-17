@@ -35,6 +35,13 @@
                 "color": "green",
                 "xray": "1"
             }
+        },
+        {
+            "type": "wokwi-logic-analyzer",
+            "id": "logic1",
+            "top": -120,
+            "left": 20,
+            "attrs": {}
         }
     ],
     "connections": [
@@ -45,7 +52,7 @@
             []
         ],
         [
-            "esp:RX",
+            "esp:開X",
             "$serialMonitor:TX",
             "",
             []
@@ -115,6 +122,30 @@
                 "h-76.4",
                 "v-115.2"
             ]
+        ],
+        [
+            "esp:19",
+            "logic1:D0",
+            "blue",
+            []
+        ],
+        [
+            "esp:18",
+            "logic1:D1",
+            "orange",
+            []
+        ],
+        [
+            "esp:5",
+            "logic1:D2",
+            "purple",
+            []
+        ],
+        [
+            "esp:4",
+            "logic1:D3",
+            "yellow",
+            []
         ]
     ],
     "dependencies": {}

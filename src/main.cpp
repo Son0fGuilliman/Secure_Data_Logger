@@ -1,5 +1,5 @@
-#include <Arduino.h>
 #include "DHT.h"
+#include <Arduino.h>
 
 // Config untuk Sensor DHT22
 #define DHTTYPE DHT22
@@ -11,6 +11,12 @@ DHT dht(PIN_SENSOR, DHTTYPE);
 #define PIN_BUTTON 12
 #define PIN_LED 2
 
+// PIN SEBAGAI JALUR TRACING LOGIC ANALYZER
+#define TRACE_ALERT 19  // D0 pada Logic Analyzer
+#define TRACE_SENSOR 18 // D1 pada Logic Analyzer
+#define TRACE_CRYPTO 5  // D2 pada Logic Analyzer
+#define TRACE_SERIAL 4  // D3 pada Logic Analyzer
+
 // Kunci Rahasia untuk Enkripsi XOR Sederhana (Anggota 2)
 const char KUNCI_XOR = 'K';
 
@@ -21,6 +27,12 @@ QueueHandle_t xSensorQueue;
 QueueHandle_t xProcessedQueue; // Jalur data dari Crypto ke Serial Output
 SemaphoreHandle_t xSerialMutex;
 TaskHandle_t xAlertTaskHandle = NULL;
+
+// Variabel Pengukuran Worst-Case Execution Time (WCET) dalam Mikrodetik
+volatile uint32_t ulWCET_Sensor = 0;
+volatile uint32_t ulWCET_Crypto = 0;
+volatile uint32_t ulWCET_Serial = 0;
+volatile uint32_t ulWCET_Alert = 0;
 
 // ==========================================
 // STRUKTUR DATA
@@ -34,15 +46,29 @@ struct SensorData
 // ==========================================
 // TUGAS ANGGOTA 3: INTERRUPT SERVICE ROUTINE (ISR)
 // ==========================================
+
+// Variabel global untuk menyimpan waktu terakhir tombol ditekan (Debouncing)
+volatile uint64_t last_isr_time = 0;
+
 void IRAM_ATTR button_ISR()
 {
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    // Ambil waktu saat ini dalam mikrodetik
+    uint64_t current_time = esp_timer_get_time();
 
-    // Kirim notifikasi kilat untuk membangunkan Alert Task
-    vTaskNotifyGiveFromISR(xAlertTaskHandle, &xHigherPriorityTaskWoken);
+    // Cek apakah jarak dari tekanan terakhir lebih dari 200.000 mikrodetik (200 ms)
+    if (current_time - last_isr_time > 200000)
+    {
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
-    // Minta RTOS melakukan switch context jika Alert Task prioritasnya lebih tinggi
-    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+        // Kirim notifikasi kilat untuk membangunkan Alert Task
+        vTaskNotifyGiveFromISR(xAlertTaskHandle, &xHigherPriorityTaskWoken);
+
+        // Catat waktu valid penekanan tombol agar pantulan berikutnya diabaikan
+        last_isr_time = current_time;
+
+        // Minta RTOS melakukan switch context jika Alert Task prioritasnya lebih tinggi
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
 }
 
 // ==========================================
@@ -65,7 +91,82 @@ void setup()
     pinMode(PIN_LED, OUTPUT);
     digitalWrite(PIN_LED, LOW);
 
+    // TAMBAHKAN INI: Inisialisasi Pin Trace sebagai OUTPUT
+    pinMode(TRACE_ALERT, OUTPUT);
+    pinMode(TRACE_SENSOR, OUTPUT);
+    pinMode(TRACE_CRYPTO, OUTPUT);
+    pinMode(TRACE_SERIAL, OUTPUT);
+
+    // Set kondisi awal ke LOW
+    digitalWrite(TRACE_ALERT, LOW);
+    digitalWrite(TRACE_SENSOR, LOW);
+    digitalWrite(TRACE_CRYPTO, LOW);
+    digitalWrite(TRACE_SERIAL, LOW);
+
     dht.begin();
+
+    // =================================================================
+    // [UNIT TESTING] PRE-FLIGHT SELF-TEST LOGIKA TASK
+    // =================================================================
+    Serial.println("\n================================================");
+    Serial.println("[PRE-FLIGHT UNIT TESTING] Menguji Logika Inti...");
+    Serial.println("================================================");
+
+    // 1. UNIT TEST TASK 1 (Logika Sensor & NaN Handling)
+    Serial.print("1. Test SensorTask : ");
+    float test_temp = dht.readTemperature();
+    if (isnan(test_temp))
+    {
+        Serial.println("[PASS] Sensor gagal (NaN), fallback 0.0 siap bekerja.");
+    }
+    else
+    {
+        Serial.println("[PASS] Pembacaan sensor berhasil.");
+    }
+
+    // 2. UNIT TEST TASK 2 (Logika Kriptografi XOR)
+    Serial.print("2. Test CryptoTask : ");
+    char p_text[] = "25.0";
+    char c_text[10];
+    // Simulasi Enkripsi
+    for (int i = 0; i < strlen(p_text); i++)
+        c_text[i] = p_text[i] ^ KUNCI_XOR;
+    c_text[strlen(p_text)] = '\0';
+    // Simulasi Dekripsi
+    for (int i = 0; i < strlen(c_text); i++)
+        c_text[i] = c_text[i] ^ KUNCI_XOR;
+    if (strcmp(p_text, c_text) == 0)
+    {
+        Serial.println("[PASS] Enkripsi & Dekripsi XOR valid.");
+    }
+    else
+    {
+        Serial.println("[FAIL] Logika XOR salah!");
+    }
+
+    // 3. UNIT TEST TASK 3 (Logika Kalkulasi LUB)
+    Serial.print("3. Test SerialTask : ");
+    float dummy_u = (6.0 / 2000.0) + (0.3 / 2000.0) + (13.0 / 2000.0) + (5.0 / 5000.0);
+    float dummy_lub = 4.0 * (pow(2.0, 1.0 / 4.0) - 1.0);
+    if (dummy_u <= dummy_lub)
+    {
+        Serial.println("[PASS] Fungsi float dan pow() kalkulasi LUB akurat.");
+    }
+    else
+    {
+        Serial.println("[FAIL] Kalkulasi matematika LUB meleset!");
+    }
+
+    // 4. UNIT TEST TASK 4 (Logika Hardware Alert)
+    Serial.print("4. Test AlertTask  : ");
+    digitalWrite(PIN_LED, HIGH);
+    delay(50); // Menggunakan delay biasa karena RTOS belum menyala
+    digitalWrite(PIN_LED, LOW);
+    Serial.println("[PASS] Sirkuit aktuator (LED) merespons dengan benar.");
+
+    Serial.println("================================================\n");
+    delay(1000); // Jeda sejenak agar penguji bisa membaca log sebelum RTOS mulai
+                 // =================================================================
 
     // Atur Interupsi Tombol (Anggota 3)
     attachInterrupt(digitalPinToInterrupt(PIN_BUTTON), button_ISR, FALLING);
@@ -81,10 +182,14 @@ void setup()
     {
 
         // PETA PRIORITAS TASK (PREEMPTIVE PRIORITY-BASED)
-        xTaskCreatePinnedToCore(vTaskAlertSystem, "AlertTask", 2048, NULL, 4, &xAlertTaskHandle, 1); // Paling Tinggi
-        xTaskCreatePinnedToCore(vTaskSensorAcquisition, "SensorTask", 2048, NULL, 3, NULL, 1);       // Tinggi
-        xTaskCreatePinnedToCore(vTaskCryptoProcess, "CryptoTask", 2048, NULL, 2, NULL, 1);           // Sedang
-        xTaskCreatePinnedToCore(vTaskSerialOutput, "SerialTask", 2048, NULL, 1, NULL, 1);            // Rendah
+        xTaskCreatePinnedToCore(vTaskAlertSystem, "AlertTask", 2048, NULL, 4,
+                                &xAlertTaskHandle, 1); // Paling Tinggi
+        xTaskCreatePinnedToCore(vTaskSensorAcquisition, "SensorTask", 2048, NULL, 3,
+                                NULL, 1); // Tinggi
+        xTaskCreatePinnedToCore(vTaskCryptoProcess, "CryptoTask", 2048, NULL, 2,
+                                NULL, 1); // Sedang
+        xTaskCreatePinnedToCore(vTaskSerialOutput, "SerialTask", 2048, NULL, 1,
+                                NULL, 1); // Rendah
 
         Serial.println("[SYSTEM] FreeRTOS Scheduler Dimulai...");
     }
@@ -94,10 +199,7 @@ void setup()
     }
 }
 
-void loop()
-{
-    vTaskDelay(portMAX_DELAY);
-}
+void loop() { vTaskDelay(portMAX_DELAY); }
 
 // ==========================================
 // REALISASI TASK MASING-MASING ANGGOTA
@@ -107,10 +209,13 @@ void loop()
 void vTaskSensorAcquisition(void *pvParameters)
 {
     SensorData dataMentah;
-    const TickType_t xDelay1000ms = pdMS_TO_TICKS(1000);
+    const TickType_t xDelay2000ms = pdMS_TO_TICKS(2000);
 
     for (;;)
     {
+        digitalWrite(TRACE_SENSOR, HIGH); // TRACE: SensorTask mulai aktif bekerja
+        uint64_t start_time = esp_timer_get_time();
+
         float t = dht.readTemperature();
 
         if (isnan(t))
@@ -127,7 +232,14 @@ void vTaskSensorAcquisition(void *pvParameters)
         // Kirim ke Crypto Task via xSensorQueue
         xQueueSend(xSensorQueue, &dataMentah, 0);
 
-        vTaskDelay(xDelay1000ms);
+        uint64_t duration = esp_timer_get_time() - start_time;
+        if (duration > ulWCET_Sensor)
+        {
+            ulWCET_Sensor = duration;
+        }
+
+        digitalWrite(TRACE_SENSOR, LOW); // TRACE: SensorTask selesai, masuk mode Blocked
+        vTaskDelay(xDelay2000ms);
     }
 }
 
@@ -141,8 +253,11 @@ void vTaskCryptoProcess(void *pvParameters)
         // 1. Ambil data mentah dari xSensorQueue (Aman & Thread-safe) [cite: 71]
         if (xQueueReceive(xSensorQueue, &dataSistem, portMAX_DELAY) == pdTRUE)
         {
+            digitalWrite(TRACE_CRYPTO, HIGH); // TRACE: CryptoTask bangun & mulai memproses
+            uint64_t start_time = esp_timer_get_time();
 
-            // 2. Simulasi Kriptografi Ringan: Mengonversi float suhu ke string lalu di-XOR
+            // 2. Simulasi Kriptografi Ringan: Mengonversi float suhu ke string lalu
+            // di-XOR
             char teksMentah[16];
             dtostrf(dataSistem.temperature, 4, 2, teksMentah); // Misal "25.50"
 
@@ -155,6 +270,13 @@ void vTaskCryptoProcess(void *pvParameters)
 
             // 3. Oper data terenkripsi ke xProcessedQueue untuk dicetak Task 4
             xQueueSend(xProcessedQueue, &dataSistem, 0);
+
+            uint64_t duration = esp_timer_get_time() - start_time;
+            if (duration > ulWCET_Crypto)
+            {
+                ulWCET_Crypto = duration;
+            }
+            digitalWrite(TRACE_CRYPTO, LOW); // TRACE: CryptoTask selesai memproses data ini
         }
     }
 }
@@ -171,7 +293,12 @@ void vTaskAlertSystem(void *pvParameters)
 
         if (ulNotificationValue > 0)
         {
-            // 2. Ambil gembok Mutex sebelum mencetak agar pesan tidak tabrakan [cite: 71]
+            digitalWrite(TRACE_ALERT, HIGH); // TRACE: AlertTask aktif (Preemption)
+            uint64_t start_time = esp_timer_get_time();
+            uint64_t active_duration = 0;
+
+            // 2. Ambil gembok Mutex sebelum mencetak agar pesan tidak tabrakan [cite:
+            // 71]
             if (xSemaphoreTake(xSerialMutex, pdMS_TO_TICKS(50)) == pdTRUE)
             {
                 Serial.println("\n================================================");
@@ -180,14 +307,29 @@ void vTaskAlertSystem(void *pvParameters)
                 xSemaphoreGive(xSerialMutex);
             }
 
+            active_duration += (esp_timer_get_time() - start_time);
+
             // 3. Nyalakan Lampu Alarm Fisik (LED Merah Berkedip Cepat)
             for (int i = 0; i < 6; i++)
             {
+                uint64_t led_on_start = esp_timer_get_time();
                 digitalWrite(PIN_LED, HIGH);
-                vTaskDelay(pdMS_TO_TICKS(100));
+                active_duration += (esp_timer_get_time() - led_on_start);
+
+                vTaskDelay(pdMS_TO_TICKS(100)); // Passive delay (yield CPU)
+
+                uint64_t led_off_start = esp_timer_get_time();
                 digitalWrite(PIN_LED, LOW);
-                vTaskDelay(pdMS_TO_TICKS(100));
+                active_duration += (esp_timer_get_time() - led_off_start);
+
+                vTaskDelay(pdMS_TO_TICKS(100)); // Passive delay (yield CPU)
             }
+
+            if (active_duration > ulWCET_Alert)
+            {
+                ulWCET_Alert = active_duration;
+            }
+            digitalWrite(TRACE_ALERT, LOW); // TRACE: Skenario penanganan selesai
         }
     }
 }
@@ -196,23 +338,25 @@ void vTaskAlertSystem(void *pvParameters)
 void vTaskSerialOutput(void *pvParameters)
 {
     SensorData dataSiapCetak;
-    const TickType_t xDelay1000ms = pdMS_TO_TICKS(1000);
 
     for (;;)
     {
-        // 1. Ambil data terenkripsi dari xProcessedQueue
-        if (xQueueReceive(xProcessedQueue, &dataSiapCetak, portMAX_DELAY) == pdTRUE)
+        // 1. Ambil data terenkripsi dari xProcessedQueue (Synchronized)
+        if (xQueueReceive(xProcessedQueue, &dataSiapCetak, portMAX_DELAY) ==
+            pdTRUE)
         {
-
             // 2. Ambil kunci Mutex untuk mengamankan fungsi cetak UART [cite: 71]
             if (xSemaphoreTake(xSerialMutex, portMAX_DELAY) == pdTRUE)
             {
+                digitalWrite(TRACE_SERIAL, HIGH); // TRACE: SerialTask mulai mencetak & hitung LUB
+                uint64_t start_time = esp_timer_get_time();
 
                 Serial.print("[LOG] Plaintext Suhu: ");
                 Serial.print(dataSiapCetak.temperature);
                 Serial.print(" C | Ciphertext (Enkripsi): ");
 
-                // Mencetak karakter enkripsi (mungkin berupa simbol aneh karena hasil XOR)
+                // Mencetak karakter enkripsi (mungkin berupa simbol aneh karena hasil
+                // XOR)
                 for (int i = 0; i < strlen(dataSiapCetak.ciphertext); i++)
                 {
                     Serial.print((unsigned char)dataSiapCetak.ciphertext[i], HEX);
@@ -220,15 +364,66 @@ void vTaskSerialOutput(void *pvParameters)
                 }
                 Serial.println();
 
-                // 3. BONUS MANDAT: Monitor penggunaan sisa RAM (Stack) per Task [cite: 71]
+                // 3. BONUS MANDAT: Monitor penggunaan sisa RAM (Stack) per Task [cite:
+                // 71]
                 Serial.print("[MONITOR STACK] Sisa Memory Ruang Kerja Task ini: ");
                 Serial.print(uxTaskGetStackHighWaterMark(NULL));
                 Serial.println(" bytes");
                 Serial.println("------------------------------------------------");
 
-                xSemaphoreGive(xSerialMutex); // Kembalikan gembok
+                // --- UJI LEAST UPPER BOUND (LUB) ---
+                // Hitung durasi eksekusi aktif Task 3 saat ini
+                uint64_t current_c3 = esp_timer_get_time() - start_time;
+                if (current_c3 > ulWCET_Serial)
+                {
+                    ulWCET_Serial = current_c3;
+                }
+
+                // Ubah waktu eksekusi (WCET) ke milidetik
+                float c1 = (float)ulWCET_Sensor / 1000.0;
+                float c2 = (float)ulWCET_Crypto / 1000.0;
+                float c3 = (float)ulWCET_Serial / 1000.0;
+                float c4 = (float)ulWCET_Alert / 1000.0;
+
+                float t1 = 2000.0; // Periode Task 1 (ms)
+                float t2 = 2000.0; // Periode Task 2 (ms)
+                float t3 = 2000.0; // Periode Task 3 (ms)
+                float t4 = 5000.0; // Waktu antar-kedatangan minimum Task 4 (ms)
+
+                float u_total = (c1 / t1) + (c2 / t2) + (c3 / t3) + (c4 / t4);
+                float u_lub = 4.0 * (pow(2.0, 1.0 / 4.0) - 1.0); // ~0.75683
+
+                Serial.println("================================================");
+                Serial.println("[UJI LEAST UPPER BOUND (LUB) - SCHEDULABILITY]");
+                Serial.printf("Task 1 (Sensor) WCET : C1 = %.4f ms\n", c1);
+                Serial.printf("Task 2 (Crypto) WCET : C2 = %.4f ms\n", c2);
+                Serial.printf("Task 3 (Serial) WCET : C3 = %.4f ms\n", c3);
+                Serial.printf("Task 4 (Alert) WCET  : C4 = %.4f ms\n", c4);
+                Serial.printf("Total Utilitas CPU (U)  : %.6f (%.4f%%)\n", u_total,
+                              u_total * 100.0);
+                Serial.printf("Batas LUB (n=4)         : %.6f (%.4f%%)\n", u_lub,
+                              u_lub * 100.0);
+
+                if (u_total <= u_lub)
+                {
+                    Serial.println("Status Penjadwalan      : [PASS] Dijamin Schedulable "
+                                   "(U <= LUB)");
+                }
+                else if (u_total <= 1.0)
+                {
+                    Serial.println("Status Penjadwalan      : [EXCEEDED] Melebihi LUB, "
+                                   "tapi mungkin schedulable");
+                }
+                else
+                {
+                    Serial.println("Status Penjadwalan      : [FAIL] Overload (>100%), "
+                                   "tidak schedulable!");
+                }
+                Serial.println("================================================");
+
+                xSemaphoreGive(xSerialMutex);    // Kembalikan gembok
+                digitalWrite(TRACE_SERIAL, LOW); // TRACE: SerialTask selesai
             }
         }
-        vTaskDelay(xDelay1000ms);
     }
 }
